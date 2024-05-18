@@ -7,22 +7,30 @@ import (
 	_ "embed" //Used for default CAs
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"cloud.google.com/go/pubsub"
-	"github.com/sirupsen/logrus"
+	githubairbrake "github.com/airbrake/gobrake/v5"
 
 	confluent "github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	githublogrus "github.com/sirupsen/logrus"
 
 	"github.com/teslamotors/fleet-telemetry/datastore/googlepubsub"
 	"github.com/teslamotors/fleet-telemetry/datastore/kafka"
 	"github.com/teslamotors/fleet-telemetry/datastore/kinesis"
 	"github.com/teslamotors/fleet-telemetry/datastore/simple"
 	"github.com/teslamotors/fleet-telemetry/datastore/zmq"
+	logrus "github.com/teslamotors/fleet-telemetry/logger"
 	"github.com/teslamotors/fleet-telemetry/metrics"
+	"github.com/teslamotors/fleet-telemetry/server/airbrake"
 	"github.com/teslamotors/fleet-telemetry/telemetry"
+)
+
+const (
+	airbrakeProjectKeyEnv = "AIRBRAKE_PROJECT_KEY"
 )
 
 // Config object for server
@@ -45,11 +53,8 @@ type Config struct {
 	// RateLimit is a configuration for the ratelimit
 	RateLimit *RateLimit `json:"rate_limit,omitempty"`
 
-	// ReliableAck if true, the server will send an ack back to the client only when the message has been stored in a datastore
-	ReliableAck bool `json:"reliable_ack,omitempty"`
-
-	// ReliableAckWorkers is the number of workers that will handle the acknowledgment
-	ReliableAckWorkers int `json:"reliable_ack_workers,omitempty"`
+	// ReliableAckSources is a mapping of record types to a dispatcher that will be used for reliable ack
+	ReliableAckSources map[string]telemetry.Dispatcher `json:"reliable_ack_sources,omitempty"`
 
 	// Kafka is a configuration for the standard librdkafka configuration properties
 	// seen here: https://raw.githubusercontent.com/confluentinc/librdkafka/master/CONFIGURATION.md
@@ -80,11 +85,26 @@ type Config struct {
 	// Records is a mapping of topics (records type) to a reference dispatch implementation (i,e: kafka)
 	Records map[string][]telemetry.Dispatcher `json:"records,omitempty"`
 
+	// TransmitDecodedRecords if true decodes proto message before dispatching it to supported datastores
+	TransmitDecodedRecords bool `json:"transmit_decoded_records,omitempty"`
+
 	// MetricCollector collects metrics for the application
 	MetricCollector metrics.MetricCollector
 
 	// AckChan is a channel used to push acknowledgment from the datastore to connected clients
 	AckChan chan (*telemetry.Record)
+
+	// Airbrake config
+	Airbrake *Airbrake
+}
+
+type Airbrake struct {
+	Host        string `json:"host"`
+	ProjectKey  string `json:"project_key"`
+	Environment string `json:"environment"`
+	ProjectId   int64  `json:"project_id"`
+
+	TLS *TLS `json:"tls" yaml:"tls"`
 }
 
 // RateLimit config for the service to handle ratelimiting incoming requests
@@ -123,39 +143,76 @@ var defaultEngCA []byte
 //go:embed files/prod_ca.crt
 var defaultProdCA []byte
 
-// TLS config for the server
+// TLS config
 type TLS struct {
 	CAFile     string `json:"ca_file"`
 	ServerCert string `json:"server_cert"`
 	ServerKey  string `json:"server_key"`
 }
 
+// AirbrakeTlsConfig return the TLS config needed for connecting with airbrake server
+func (c *Config) AirbrakeTlsConfig() (*tls.Config, error) {
+	if c.Airbrake.TLS == nil {
+		return nil, nil
+	}
+	caPath := c.Airbrake.TLS.CAFile
+	certPath := c.Airbrake.TLS.ServerCert
+	keyPath := c.Airbrake.TLS.ServerKey
+	tlsConfig := &tls.Config{}
+	if certPath != "" && keyPath != "" {
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("can't properly load cert pair (%s, %s): %s", certPath, keyPath, err.Error())
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+		tlsConfig.BuildNameToCertificate()
+	}
+
+	if caPath != "" {
+		clientCACert, err := os.ReadFile(caPath)
+		if err != nil {
+			return nil, fmt.Errorf("can't properly load ca cert (%s): %s", caPath, err.Error())
+		}
+		clientCertPool := x509.NewCertPool()
+		clientCertPool.AppendCertsFromPEM(clientCACert)
+		tlsConfig.RootCAs = clientCertPool
+	}
+
+	return tlsConfig, nil
+}
+
 // ExtractServiceTLSConfig return the TLS config needed for stating the mTLS Server
-func (c *Config) ExtractServiceTLSConfig() (*tls.Config, error) {
+func (c *Config) ExtractServiceTLSConfig(logger *logrus.Logger) (*tls.Config, error) {
 	if c.TLS == nil {
 		return nil, errors.New("tls config is empty - telemetry server is mTLS only, make sure to provide certificates in the config")
 	}
 
-	var err error
 	var caFileBytes []byte
-	if c.TLS.CAFile == "" {
-		if c.UseDefaultEngCA {
-			caFileBytes = make([]byte, len(defaultEngCA))
-			copy(caFileBytes, defaultEngCA)
-		} else {
-			caFileBytes = make([]byte, len(defaultProdCA))
-			copy(caFileBytes, defaultProdCA)
-		}
+	var caEnv string
+	if c.UseDefaultEngCA {
+		caEnv = "eng"
+		caFileBytes = make([]byte, len(defaultEngCA))
+		copy(caFileBytes, defaultEngCA)
 	} else {
-		caFileBytes, err = os.ReadFile(c.TLS.CAFile)
-		if err != nil {
-			return nil, err
-		}
+		caEnv = "prod"
+		caFileBytes = make([]byte, len(defaultProdCA))
+		copy(caFileBytes, defaultProdCA)
 	}
 	caCertPool := x509.NewCertPool()
 	ok := caCertPool.AppendCertsFromPEM(caFileBytes)
 	if !ok {
-		return nil, fmt.Errorf("tls ca not properly loaded: %s", c.TLS.CAFile)
+		return nil, fmt.Errorf("tls ca not properly loaded for %s environment", caEnv)
+	}
+	if c.TLS.CAFile != "" {
+		customCaFileBytes, err := os.ReadFile(c.TLS.CAFile)
+		if err != nil {
+			return nil, err
+		}
+		ok := caCertPool.AppendCertsFromPEM(customCaFileBytes)
+		if !ok {
+			return nil, fmt.Errorf("custom ca not properly loaded: %s", c.TLS.CAFile)
+		}
+		logger.ActivityLog("custom_ca_file_appened", logrus.LogInfo{"ca_file_path": c.TLS.CAFile})
 	}
 
 	return &tls.Config{
@@ -165,17 +222,13 @@ func (c *Config) ExtractServiceTLSConfig() (*tls.Config, error) {
 }
 
 func (c *Config) configureLogger(logger *logrus.Logger) {
-	level, err := logrus.ParseLevel(c.LogLevel)
+	level, err := githublogrus.ParseLevel(c.LogLevel)
 	if err != nil {
-		logger.Errorf("Invalid level: %s\n", err)
+		logger.ErrorLog("invalid_level", err, nil)
 	} else {
-		logrus.SetLevel(level)
+		githublogrus.SetLevel(level)
 	}
-
-	// Log as JSON instead of the default ASCII formatter.
-	if c.JSONLogEnable {
-		logrus.SetFormatter(&logrus.JSONFormatter{TimestampFormat: time.RFC3339Nano})
-	}
+	logger.SetJSONFormatter(c.JSONLogEnable)
 }
 
 func (c *Config) configureMetricsCollector(logger *logrus.Logger) {
@@ -190,7 +243,12 @@ func (c *Config) prometheusEnabled() bool {
 }
 
 // ConfigureProducers validates and establishes connections to the producers (kafka/pubsub/logger)
-func (c *Config) ConfigureProducers(logger *logrus.Logger) (map[string][]telemetry.Producer, error) {
+func (c *Config) ConfigureProducers(airbrakeHandler *airbrake.AirbrakeHandler, logger *logrus.Logger) (map[string][]telemetry.Producer, error) {
+	reliableAckSources, err := c.configureReliableAckSources()
+	if err != nil {
+		return nil, err
+	}
+
 	producers := make(map[telemetry.Dispatcher]telemetry.Producer)
 	producers[telemetry.Logger] = simple.NewProtoLogger(logger)
 
@@ -206,7 +264,7 @@ func (c *Config) ConfigureProducers(logger *logrus.Logger) (map[string][]telemet
 			return nil, errors.New("Expected Kafka to be configured")
 		}
 		convertKafkaConfig(c.Kafka)
-		kafkaProducer, err := kafka.NewProducer(c.Kafka, c.Namespace, c.ReliableAckWorkers, c.AckChan, c.prometheusEnabled(), c.MetricCollector, logger)
+		kafkaProducer, err := kafka.NewProducer(c.Kafka, c.Namespace, c.prometheusEnabled(), c.MetricCollector, airbrakeHandler, c.AckChan, reliableAckSources[telemetry.Kafka], logger)
 		if err != nil {
 			return nil, err
 		}
@@ -217,7 +275,7 @@ func (c *Config) ConfigureProducers(logger *logrus.Logger) (map[string][]telemet
 		if c.Pubsub == nil {
 			return nil, errors.New("Expected Pubsub to be configured")
 		}
-		googleProducer, err := googlepubsub.NewProducer(context.Background(), c.prometheusEnabled(), c.Pubsub.ProjectID, c.Namespace, c.MetricCollector, logger)
+		googleProducer, err := googlepubsub.NewProducer(context.Background(), c.prometheusEnabled(), c.Pubsub.ProjectID, c.Namespace, c.MetricCollector, airbrakeHandler, c.AckChan, reliableAckSources[telemetry.Pubsub], logger)
 		if err != nil {
 			return nil, err
 		}
@@ -233,7 +291,7 @@ func (c *Config) ConfigureProducers(logger *logrus.Logger) (map[string][]telemet
 			maxRetries = *c.Kinesis.MaxRetries
 		}
 		streamMapping := c.CreateKinesisStreamMapping(recordNames)
-		kinesis, err := kinesis.NewProducer(maxRetries, streamMapping, c.Kinesis.OverrideHost, c.prometheusEnabled(), c.MetricCollector, logger)
+		kinesis, err := kinesis.NewProducer(maxRetries, streamMapping, c.Kinesis.OverrideHost, c.prometheusEnabled(), c.MetricCollector, airbrakeHandler, c.AckChan, reliableAckSources[telemetry.Kinesis], logger)
 		if err != nil {
 			return nil, err
 		}
@@ -244,7 +302,7 @@ func (c *Config) ConfigureProducers(logger *logrus.Logger) (map[string][]telemet
 		if c.ZMQ == nil {
 			return nil, errors.New("Expected ZMQ to be configured")
 		}
-		zmqProducer, err := zmq.NewProducer(context.Background(), c.ZMQ, c.MetricCollector, c.Namespace, logger)
+		zmqProducer, err := zmq.NewProducer(context.Background(), c.ZMQ, c.MetricCollector, c.Namespace, airbrakeHandler, c.AckChan, reliableAckSources[telemetry.ZMQ], logger)
 		if err != nil {
 			return nil, err
 		}
@@ -265,6 +323,43 @@ func (c *Config) ConfigureProducers(logger *logrus.Logger) (map[string][]telemet
 	}
 
 	return dispatchProducerRules, nil
+}
+
+func (c *Config) configureReliableAckSources() (map[telemetry.Dispatcher]map[string]interface{}, error) {
+	reliableAckSources := make(map[telemetry.Dispatcher]map[string]interface{}, 0)
+	for txType, dispatchRule := range c.ReliableAckSources {
+		if dispatchRule == telemetry.Logger {
+			return nil, fmt.Errorf("logger cannot be configured as reliable ack for record: %s", txType)
+		}
+		dispatchers, ok := c.Records[txType]
+		if !ok {
+			return nil, fmt.Errorf("%s cannot be configured as reliable ack for record: %s since no record mapping exists", dispatchRule, txType)
+		}
+		dispatchRuleFound := false
+		validDispatchers := parseValidDispatchers(dispatchers)
+		for _, dispatcher := range validDispatchers {
+			if dispatcher == dispatchRule {
+				dispatchRuleFound = true
+				reliableAckSources[dispatchRule] = map[string]interface{}{txType: true}
+				break
+			}
+		}
+		if !dispatchRuleFound {
+			return nil, fmt.Errorf("%s cannot be configured as reliable ack for record: %s. Valid datastores configured %v", dispatchRule, txType, validDispatchers)
+		}
+	}
+	return reliableAckSources, nil
+}
+
+// parseValidDispatchers removes no-op dispatcher from the input i.e. Logger
+func parseValidDispatchers(input []telemetry.Dispatcher) []telemetry.Dispatcher {
+	var result []telemetry.Dispatcher
+	for _, v := range input {
+		if v != telemetry.Logger {
+			result = append(result, v)
+		}
+	}
+	return result
 }
 
 // convertKafkaConfig will prioritize int over float
@@ -293,4 +388,46 @@ func (c *Config) CreateKinesisStreamMapping(recordNames []string) map[string]str
 		}
 	}
 	return streamMapping
+}
+
+// CreateAirbrakeNotifier intializes an airbrake notifier with standard configs
+func (c *Config) CreateAirbrakeNotifier(logger *logrus.Logger) (*githubairbrake.Notifier, *githubairbrake.NotifierOptions, error) {
+	if c.Airbrake == nil {
+		return nil, nil, nil
+	}
+	tlsConfig, err := c.AirbrakeTlsConfig()
+	if err != nil {
+		return nil, nil, err
+	}
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
+	httpClient := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+	}
+	errbitHost := c.Airbrake.Host
+	projectKey, ok := os.LookupEnv(airbrakeProjectKeyEnv)
+	logInfo := logrus.LogInfo{}
+	if ok {
+		logInfo["source"] = "environment_variable"
+		logInfo["env_key"] = airbrakeProjectKeyEnv
+
+	} else {
+		projectKey = c.Airbrake.ProjectKey
+		logInfo["source"] = "config_file"
+	}
+	logger.ActivityLog("airbrake_configured", logInfo)
+	options := &githubairbrake.NotifierOptions{
+		Host:                errbitHost,
+		RemoteConfigHost:    errbitHost,
+		DisableRemoteConfig: true,
+		APMHost:             errbitHost,
+		DisableAPM:          true,
+		ProjectId:           c.Airbrake.ProjectId,
+		ProjectKey:          projectKey,
+		Environment:         c.Airbrake.Environment,
+		HTTPClient:          httpClient,
+	}
+	return githubairbrake.NewNotifierWithOptions(options), options, nil
 }

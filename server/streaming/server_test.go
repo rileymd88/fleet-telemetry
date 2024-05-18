@@ -10,9 +10,11 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/gorilla/websocket"
-	"github.com/sirupsen/logrus/hooks/test"
 
 	"github.com/teslamotors/fleet-telemetry/config"
+	logrus "github.com/teslamotors/fleet-telemetry/logger"
+	"github.com/teslamotors/fleet-telemetry/metrics/adapter/noop"
+	"github.com/teslamotors/fleet-telemetry/server/airbrake"
 	"github.com/teslamotors/fleet-telemetry/server/streaming"
 	"github.com/teslamotors/fleet-telemetry/telemetry"
 )
@@ -37,23 +39,23 @@ var _ = Describe("Socket handler test", func() {
 	})
 
 	It("ServeBinaryWs test", func() {
-		logger, hook := test.NewNullLogger()
+		logger, hook := logrus.NoOpLogger()
 		conf := &config.Config{
 			RateLimit: &config.RateLimit{
 				MessageLimit:              1,
 				MessageIntervalTimeSecond: 1 * time.Second,
 			},
+			MetricCollector: noop.NewCollector(),
 		}
 
 		registry := streaming.NewSocketRegistry()
-		req := httptest.NewRequest("GET", "http://tel.vn.tesla.com", nil)
+		req := httptest.NewRequest("GET", "http://test-server.example.com", nil)
 
 		producerRules := make(map[string][]telemetry.Producer)
-		mux := http.NewServeMux()
-		_, s, err := streaming.InitServer(conf, mux, producerRules, logger, registry)
+		_, s, err := streaming.InitServer(conf, airbrake.NewAirbrakeHandler(nil), producerRules, logger, registry)
 		Expect(err).NotTo(HaveOccurred())
 
-		srv := httptest.NewServer(http.HandlerFunc(s.ServeBinaryWs(conf, registry)))
+		srv := httptest.NewServer(http.HandlerFunc(s.ServeBinaryWs(conf)))
 		u, _ := url.Parse(srv.URL)
 		u.Scheme = "ws"
 

@@ -1,4 +1,4 @@
-package simple_test
+package logrus
 
 import (
 	"testing"

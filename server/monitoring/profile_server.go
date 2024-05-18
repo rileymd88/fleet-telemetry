@@ -5,11 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"runtime/debug"
-	"strings"
-
-	"github.com/sirupsen/logrus"
 
 	"github.com/teslamotors/fleet-telemetry/config"
+	logrus "github.com/teslamotors/fleet-telemetry/logger"
 	"github.com/teslamotors/fleet-telemetry/metrics"
 )
 
@@ -19,11 +17,6 @@ type profileServer struct {
 // liveProfiler profiles https requests
 func (p *profileServer) liveProfiler(config *config.Config) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.RemoteAddr, "127.0.0.1") { // enable this only locally
-			w.WriteHeader(404)
-			return
-		}
-
 		if config.Monitoring == nil || config.Monitoring.ProfilingPath == "" { // disabled by default
 			w.WriteHeader(405)
 			_, _ = w.Write([]byte(`{"error":"profiler not configured"}`))
@@ -68,5 +61,6 @@ func StartProfilerServer(config *config.Config, mux *http.ServeMux, logger *logr
 	profileServer := &profileServer{}
 	mux.HandleFunc("/gc_stats", profileServer.gcStats(config))
 	mux.HandleFunc("/live_profiler", profileServer.liveProfiler(config))
-	logger.Infoln("profiler_started")
+
+	logger.ActivityLog("profiler_started", logrus.LogInfo{"port": config.Monitoring.ProfilerPort})
 }

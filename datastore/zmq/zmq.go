@@ -7,9 +7,10 @@ import (
 	"sync"
 
 	"github.com/pebbe/zmq4"
-	"github.com/sirupsen/logrus"
+	logrus "github.com/teslamotors/fleet-telemetry/logger"
 	"github.com/teslamotors/fleet-telemetry/metrics"
 	"github.com/teslamotors/fleet-telemetry/metrics/adapter"
+	"github.com/teslamotors/fleet-telemetry/server/airbrake"
 	"github.com/teslamotors/fleet-telemetry/telemetry"
 )
 
@@ -41,9 +42,10 @@ type KeyJSON struct {
 
 // Metrics stores metrics reported from this package
 type Metrics struct {
-	errorCount   adapter.Counter
-	publishCount adapter.Counter
-	byteTotal    adapter.Counter
+	errorCount       adapter.Counter
+	publishCount     adapter.Counter
+	byteTotal        adapter.Counter
+	reliableAckCount adapter.Counter
 }
 
 var (
@@ -58,10 +60,13 @@ const MonitorSocketAddr = "inproc://zmq_socket_monitor.rep"
 // ZMQProducer implements the telemetry.Producer interface by publishing to a
 // bound zmq socket.
 type ZMQProducer struct {
-	namespace string
-	ctx       context.Context
-	sock      *zmq4.Socket
-	logger    *logrus.Logger
+	namespace          string
+	ctx                context.Context
+	sock               *zmq4.Socket
+	logger             *logrus.Logger
+	airbrakeHandler    *airbrake.AirbrakeHandler
+	ackChan            chan (*telemetry.Record)
+	reliableAckTxTypes map[string]interface{}
 }
 
 // Publish the record to the socket.
@@ -69,13 +74,22 @@ func (p *ZMQProducer) Produce(rec *telemetry.Record) {
 	if p.ctx.Err() != nil {
 		return
 	}
-	if nBytes, err := p.sock.SendMessage(telemetry.BuildTopicName(p.namespace, rec.TxType), rec.Payload()); err != nil {
+	nBytes, err := p.sock.SendMessage(telemetry.BuildTopicName(p.namespace, rec.TxType), rec.Payload())
+	if err != nil {
 		metricsRegistry.errorCount.Inc(map[string]string{"record_type": rec.TxType})
-		p.logger.Errorf("Failed sending log on zmq socket: %s", err.Error())
+		p.ReportError("zmq_dispatch_error", err, nil)
+		return
 	} else {
-		metricsRegistry.byteTotal.Add(int64(nBytes), map[string]string{"record_type": rec.TxType})
-		metricsRegistry.publishCount.Inc(map[string]string{"record_type": rec.TxType})
+		p.ProcessReliableAck(rec)
 	}
+	metricsRegistry.byteTotal.Add(int64(nBytes), map[string]string{"record_type": rec.TxType})
+	metricsRegistry.publishCount.Inc(map[string]string{"record_type": rec.TxType})
+}
+
+// ReportError to airbrake and logger
+func (p *ZMQProducer) ReportError(message string, err error, logInfo logrus.LogInfo) {
+	p.airbrakeHandler.ReportLogMessage(logrus.ERROR, message, err, logInfo)
+	p.logger.ErrorLog(message, err, logInfo)
 }
 
 // Close the underlying socket.
@@ -89,8 +103,17 @@ func (p *ZMQProducer) Close() error {
 	return nil
 }
 
+// ProcessReliableAck sends to ackChan if reliable ack is configured
+func (p *ZMQProducer) ProcessReliableAck(entry *telemetry.Record) {
+	_, ok := p.reliableAckTxTypes[entry.TxType]
+	if ok {
+		p.ackChan <- entry
+		metricsRegistry.reliableAckCount.Inc(map[string]string{"record_type": entry.TxType})
+	}
+}
+
 // NewProducer creates a ZMQProducer with the given config.
-func NewProducer(ctx context.Context, config *Config, metrics metrics.MetricCollector, namespace string, logger *logrus.Logger) (producer telemetry.Producer, err error) {
+func NewProducer(ctx context.Context, config *Config, metrics metrics.MetricCollector, namespace string, airbrakeHandler *airbrake.AirbrakeHandler, ackChan chan (*telemetry.Record), reliableAckTxTypes map[string]interface{}, logger *logrus.Logger) (producer telemetry.Producer, err error) {
 	registerMetricsOnce(metrics)
 	sock, err := zmq4.NewSocket(zmq4.PUB)
 	if err != nil {
@@ -146,7 +169,13 @@ func NewProducer(ctx context.Context, config *Config, metrics metrics.MetricColl
 	}
 
 	return &ZMQProducer{
-		namespace, ctx, sock, logger,
+		namespace:          namespace,
+		ctx:                ctx,
+		sock:               sock,
+		logger:             logger,
+		airbrakeHandler:    airbrakeHandler,
+		ackChan:            ackChan,
+		reliableAckTxTypes: reliableAckTxTypes,
 	}, nil
 }
 
@@ -175,11 +204,10 @@ func logSocketInBackground(target *zmq4.Socket, logger *logrus.Logger, addr stri
 
 			eventType, addr, value, err := monitor.RecvEvent(0)
 			if err != nil {
-				logger.Errorf("Failed to receive event on zmq socket: %s", err)
+				logger.ErrorLog("zmq_event_receive_error", err, nil)
 				continue
 			}
-
-			logger.Debugf("ZMQ socket event: %v %v %v", eventType, addr, value)
+			logger.Log(logrus.DEBUG, "zmq_socket_event", logrus.LogInfo{"event_type": eventType, "addr": addr, "value": value})
 		}
 	}()
 
@@ -202,6 +230,12 @@ func registerMetrics(metricsCollector metrics.MetricCollector) {
 	metricsRegistry.byteTotal = metricsCollector.RegisterCounter(adapter.CollectorOptions{
 		Name:   "zmq_publish_total_bytes",
 		Help:   "The number of bytes published to ZMQ.",
+		Labels: []string{"record_type"},
+	})
+
+	metricsRegistry.reliableAckCount = metricsCollector.RegisterCounter(adapter.CollectorOptions{
+		Name:   "zmq_reliable_ack_total",
+		Help:   "The number of records produced to ZMQ for which we sent a reliable ACK.",
 		Labels: []string{"record_type"},
 	})
 }

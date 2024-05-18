@@ -4,8 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/sirupsen/logrus"
-
+	logrus "github.com/teslamotors/fleet-telemetry/logger"
 	"github.com/teslamotors/fleet-telemetry/messages"
 	"github.com/teslamotors/fleet-telemetry/messages/tesla"
 )
@@ -21,17 +20,15 @@ type BinarySerializer struct {
 	DispatchRules   map[string][]Producer
 	RequestIdentity *RequestIdentity
 
-	logger      *logrus.Logger
-	reliableAck bool
+	logger *logrus.Logger
 }
 
 // NewBinarySerializer returns a dedicated serializer for a current socket connection
-func NewBinarySerializer(requestIdentity *RequestIdentity, dispatchRules map[string][]Producer, reliableAck bool, logger *logrus.Logger) *BinarySerializer {
+func NewBinarySerializer(requestIdentity *RequestIdentity, dispatchRules map[string][]Producer, logger *logrus.Logger) *BinarySerializer {
 	return &BinarySerializer{
 		DispatchRules:   dispatchRules,
 		RequestIdentity: requestIdentity,
 		logger:          logger,
-		reliableAck:     reliableAck,
 	}
 }
 
@@ -52,7 +49,7 @@ func (bs *BinarySerializer) Deserialize(msg []byte, socketID string) (record *Re
 	streamMessage.SetDeliveredAt(time.Now())
 	record.RawBytes, err = streamMessage.ToBytes()
 	if err != nil {
-		bs.Logger().Errorf("set_delivered_at_bytes_error error:%v, topic: %v, txid: %v", err, record.TxType, record.Txid)
+		bs.logger.ErrorLog("set_delivered_at_bytes_error", err, logrus.LogInfo{"record_type": record.TxType, "txid": record.Txid})
 	}
 
 	record.TxType = streamMessage.Topic()
@@ -66,7 +63,7 @@ func (bs *BinarySerializer) Deserialize(msg []byte, socketID string) (record *Re
 	}
 
 	if string(streamMessage.SenderID) != bs.RequestIdentity.SenderID && string(streamMessage.SenderID) != bs.RequestIdentity.DeviceID {
-		bs.logger.Errorf("unexpected_sender_id sender_id: %v, expected_sender_id: %v, txid: %v, topic: %v", string(streamMessage.SenderID), bs.RequestIdentity.SenderID, record.Txid, record.TxType)
+		bs.logger.ErrorLog("unexpected_sender_id", err, logrus.LogInfo{"sender_id": string(streamMessage.SenderID), "expected_sender_id": bs.RequestIdentity.SenderID, "txid": record.Txid, "record_type": record.TxType})
 		return record, fmt.Errorf("message SenderID: %s do not match vehicleID: %s", string(streamMessage.SenderID), bs.RequestIdentity.SenderID)
 	}
 
@@ -92,11 +89,6 @@ func (bs *BinarySerializer) Dispatch(record *Record) {
 	for _, producer := range bs.DispatchRules[record.TxType] {
 		producer.Produce(record)
 	}
-}
-
-// ReliableAck returns true if serializer supports reliable acks (only ack to car once datastore acked the data)
-func (bs *BinarySerializer) ReliableAck() bool {
-	return bs.reliableAck
 }
 
 // Logger returns logger for the serializer

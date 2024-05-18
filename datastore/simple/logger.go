@@ -1,69 +1,35 @@
 package simple
 
 import (
-	"fmt"
-
-	"github.com/sirupsen/logrus"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
-
-	"github.com/teslamotors/fleet-telemetry/protos"
+	logrus "github.com/teslamotors/fleet-telemetry/logger"
 	"github.com/teslamotors/fleet-telemetry/telemetry"
 )
 
 // ProtoLogger is a simple protobuf logger
 type ProtoLogger struct {
-	logger  *logrus.Logger
-	options protojson.MarshalOptions
+	logger *logrus.Logger
 }
-
-var (
-	protobufMap = map[string]func() proto.Message{
-		"alerts": func() proto.Message {
-			return &protos.VehicleAlerts{}
-		},
-		"errors": func() proto.Message {
-			return &protos.VehicleErrors{}
-		},
-		"V": func() proto.Message {
-			return &protos.Payload{}
-		},
-	}
-)
 
 // NewProtoLogger initializes the parameters for protobuf payload logging
 func NewProtoLogger(logger *logrus.Logger) telemetry.Producer {
-	return &ProtoLogger{
-		logger: logger,
-		options: protojson.MarshalOptions{
-			UseEnumNumbers:  false,
-			EmitUnpopulated: true,
-			Indent:          ""}}
-
+	return &ProtoLogger{logger: logger}
 }
 
-// GetProtoMessage converts telemetry record to protoMessage based on txType
-func (p *ProtoLogger) GetProtoMessage(entry *telemetry.Record) (proto.Message, error) {
-	msgFunc, ok := protobufMap[entry.TxType]
-	if !ok {
-		return nil, fmt.Errorf("no mapping for txType: %s", entry.TxType)
-	}
-	message := msgFunc()
-	err := proto.Unmarshal(entry.Payload(), message)
-	return message, err
+// SetReliableAckTxType no-op for logger datastore
+func (p *ProtoLogger) ProcessReliableAck(entry *telemetry.Record) {
 }
 
 // Produce sends the data to the logger
 func (p *ProtoLogger) Produce(entry *telemetry.Record) {
-	payload, err := p.GetProtoMessage(entry)
+	data, err := entry.GetJSONPayload()
 	if err != nil {
-		p.logger.Errorf("logger_proto_unmarshal_error %s %v %s\n", entry.Vin, entry.Metadata(), err.Error())
+		p.logger.ErrorLog("json_unmarshal_error", err, logrus.LogInfo{"vin": entry.Vin, "metadata": entry.Metadata()})
 		return
 	}
-	output, err := p.options.Marshal(payload)
-	if err != nil {
-		p.logger.Errorf("logger_json_unmarshal_error %s %v %s\n", entry.Vin, entry.Metadata(), err.Error())
-	} else {
-		p.logger.Infof("logger_json_unmarshal %s %v %s\n", entry.Vin, entry.Metadata(), output)
-	}
+	p.logger.ActivityLog("logger_json_unmarshal", logrus.LogInfo{"vin": entry.Vin, "metadata": entry.Metadata(), "data": string(data)})
+}
+
+// ReportError noop method
+func (p *ProtoLogger) ReportError(message string, err error, logInfo logrus.LogInfo) {
+	return
 }

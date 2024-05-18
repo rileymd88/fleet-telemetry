@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
@@ -13,9 +12,9 @@ import (
 	"github.com/beefsack/go-rate"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/sirupsen/logrus"
 
 	"github.com/teslamotors/fleet-telemetry/config"
+	logrus "github.com/teslamotors/fleet-telemetry/logger"
 	"github.com/teslamotors/fleet-telemetry/metrics"
 	"github.com/teslamotors/fleet-telemetry/metrics/adapter"
 	"github.com/teslamotors/fleet-telemetry/telemetry"
@@ -40,14 +39,15 @@ type SocketManager struct {
 	StartTime    time.Time
 	UUID         string
 
-	config           *config.Config
-	logger           *logrus.Logger
-	registry         *SocketRegistry
-	requestIdentity  *telemetry.RequestIdentity
-	requestInfo      map[string]interface{}
-	metricsCollector metrics.MetricCollector
-	stopChan         chan struct{}
-	writeChan        chan SocketMessage
+	config                 *config.Config
+	logger                 *logrus.Logger
+	registry               *SocketRegistry
+	requestIdentity        *telemetry.RequestIdentity
+	requestInfo            map[string]interface{}
+	metricsCollector       metrics.MetricCollector
+	stopChan               chan struct{}
+	writeChan              chan SocketMessage
+	transmitDecodedRecords bool
 }
 
 // SocketMessage represents incoming socket connection
@@ -67,11 +67,6 @@ type Metrics struct {
 	socketErrorCount             adapter.Counter
 	recordSizeBytesTotal         adapter.Counter
 	recordCount                  adapter.Counter
-	kafkaWriteCount              adapter.Counter
-	kafkaWriteBytesTotal         adapter.Counter
-	kafkaWriteMs                 adapter.Timer
-	reliableAckCount             adapter.Counter
-	reliableAckMissCount         adapter.Counter
 }
 
 var (
@@ -83,7 +78,7 @@ var (
 func NewSocketManager(ctx context.Context, requestIdentity *telemetry.RequestIdentity, ws *websocket.Conn, config *config.Config, logger *logrus.Logger) *SocketManager {
 	registerMetricsOnce(config.MetricCollector)
 
-	requestLogInfo, socketUUID := buildRequestContext(ctx, logger)
+	requestLogInfo, socketUUID := buildRequestContext(ctx)
 
 	return &SocketManager{
 		Ws:           ws,
@@ -92,17 +87,18 @@ func NewSocketManager(ctx context.Context, requestIdentity *telemetry.RequestIde
 		StartTime:    time.Now(),
 		UUID:         socketUUID.String(),
 
-		config:           config,
-		metricsCollector: config.MetricCollector,
-		logger:           logger,
-		requestInfo:      requestLogInfo,
-		writeChan:        make(chan SocketMessage, 1000),
-		stopChan:         make(chan struct{}),
-		requestIdentity:  requestIdentity,
+		config:                 config,
+		metricsCollector:       config.MetricCollector,
+		logger:                 logger,
+		requestInfo:            requestLogInfo,
+		writeChan:              make(chan SocketMessage, 1000),
+		stopChan:               make(chan struct{}),
+		requestIdentity:        requestIdentity,
+		transmitDecodedRecords: config.TransmitDecodedRecords,
 	}
 }
 
-func buildRequestContext(ctx context.Context, logger *logrus.Logger) (logInfo map[string]interface{}, socketUUID uuid.UUID) {
+func buildRequestContext(ctx context.Context) (logInfo map[string]interface{}, socketUUID uuid.UUID) {
 	socketUUID = uuid.New()
 	logInfo = make(map[string]interface{})
 	if ctx == nil {
@@ -146,12 +142,12 @@ func (sm *SocketManager) ListenToWriteChannel() SocketMessage {
 // Close shuts down a socket connection for a single client and log metrics
 func (sm *SocketManager) Close() {
 	if err := sm.Ws.Close(); err != nil {
-		sm.logger.Errorf("websocket_close error=%v", err)
+		sm.logger.ErrorLog("websocket_close_err", err, nil)
 	}
 
 	socketMetrics := sm.RecordsStatsToLogInfo()
 	socketMetrics["duration_sec"] = int(time.Since(sm.StartTime) / time.Second) // Result is in nanosecond, converting it to seconds
-	sm.logger.Infof("socket_disconnected data=%v", socketMetrics)
+	sm.logger.ActivityLog("socket_disconnected", socketMetrics)
 }
 
 // RecordsStatsToLogInfo formats the stats map into a string
@@ -173,11 +169,11 @@ func (sm *SocketManager) ProcessTelemetry(serializer *telemetry.BinarySerializer
 		close(sm.stopChan)
 	}()
 
-	sm.logger.Infof("socket_connected data=%v", sm.requestInfo)
+	sm.logger.ActivityLog("socket_connected", sm.requestInfo)
 	go sm.writer()
 	var rl *rate.RateLimiter
 
-	if sm.config.RateLimit != nil {
+	if sm.config.RateLimit != nil && sm.config.RateLimit.Enabled {
 		rl = rate.New(sm.config.RateLimit.MessageLimit, sm.config.RateLimit.MessageIntervalTimeSecond)
 	} else {
 		rl = rate.New(100, 60*time.Second)
@@ -200,7 +196,7 @@ func (sm *SocketManager) ProcessTelemetry(serializer *telemetry.BinarySerializer
 			}
 			// client exceeded the rate limit
 			messagesRateLimited++
-			record, _ := telemetry.NewRecord(serializer, message, sm.UUID)
+			record, _ := telemetry.NewRecord(serializer, message, sm.UUID, sm.transmitDecodedRecords)
 			metricsRegistry.rateLimitExceededCount.Inc(map[string]string{"device_id": sm.requestIdentity.DeviceID, "txtype": record.TxType})
 			if sm.config.RateLimit != nil && sm.config.RateLimit.Enabled {
 				continue
@@ -211,7 +207,7 @@ func (sm *SocketManager) ProcessTelemetry(serializer *telemetry.BinarySerializer
 			if len(parts) > 2 {
 				duration := time.Since(rateLimitStartTime) / time.Second
 
-				sm.logger.Errorf("rate_limit_exceeded txid=%v, duration_sec=%v messages_rate_limited=%v", parts[2], duration, messagesRateLimited)
+				sm.logger.ErrorLog("rate_limit_exceeded", nil, logrus.LogInfo{"txid": parts[2], "duration_sec": duration, "messages_rate_limited": messagesRateLimited})
 			}
 			messagesRateLimited = 0
 		}
@@ -221,8 +217,8 @@ func (sm *SocketManager) ProcessTelemetry(serializer *telemetry.BinarySerializer
 
 // ParseAndProcessRecord reads incoming client message and dispatches to relevant producer
 func (sm *SocketManager) ParseAndProcessRecord(serializer *telemetry.BinarySerializer, message []byte) {
-	record, err := telemetry.NewRecord(serializer, message, sm.UUID)
-	logInfo := fmt.Sprintf("txid=%v, txtype=%v", record.Txid, record.TxType)
+	record, err := telemetry.NewRecord(serializer, message, sm.UUID, sm.transmitDecodedRecords)
+	logInfo := logrus.LogInfo{"txid": record.Txid, "record_type": record.TxType}
 
 	if err != nil {
 		if err == telemetry.ErrMessageTooBig {
@@ -233,14 +229,16 @@ func (sm *SocketManager) ParseAndProcessRecord(serializer *telemetry.BinarySeria
 
 		switch typedError := err.(type) {
 		case *telemetry.UnauthorizedSenderIDError:
-			logInfo = fmt.Sprintf("%s sender_id=%s, expected_sender_id=%s", logInfo, typedError.ReceivedSenderID, typedError.ExpectedSenderID)
-			sm.logger.Errorf("unauthorized_sender_id error=%v %v", err, logInfo)
+			logInfo["sender_id"] = typedError.ReceivedSenderID
+			logInfo["expected_sender_id"] = typedError.ExpectedSenderID
+			sm.logger.ErrorLog("unauthorized_sender_id", nil, logInfo)
 			metricsRegistry.unauthorizedSenderCount.Inc(map[string]string{})
 			sm.respondToVehicle(record, nil) // respond to the client message was accepted so they are not resending it over and over
 			return
 		case *telemetry.UnknownMessageType:
-			logInfo = fmt.Sprintf("%s msg_txid=%s, msg_type=%s", logInfo, typedError.Txid, string(typedError.GuessedType))
-			sm.logger.Errorf("unknown_message_type_error error=%v %v", err, logInfo)
+			logInfo["msg_txid"] = typedError.Txid
+			logInfo["msg_type"] = string(typedError.GuessedType)
+			sm.logger.ErrorLog("unknown_message_type_error", err, logInfo)
 			metricsRegistry.unknownMessageTypeErrorCount.Inc(map[string]string{"msg_type": string(typedError.GuessedType)})
 			sm.respondToVehicle(record, nil) // respond to the client message was accepted so they are not resending it over and over
 		default:
@@ -254,9 +252,14 @@ func (sm *SocketManager) ParseAndProcessRecord(serializer *telemetry.BinarySeria
 	sm.processRecord(record)
 
 	// respond instantly to the client if we are not doing reliable ACKs
-	if !serializer.ReliableAck() {
+	if !sm.reliableAck(record) {
 		sm.respondToVehicle(record, nil)
 	}
+}
+
+func (sm *SocketManager) reliableAck(record *telemetry.Record) bool {
+	_, ok := sm.config.ReliableAckSources[record.TxType]
+	return ok
 }
 
 func (sm *SocketManager) processRecord(record *telemetry.Record) {
@@ -267,39 +270,41 @@ func (sm *SocketManager) processRecord(record *telemetry.Record) {
 // respondToVehicle sends an ack message to the client to acknowledge that the records have been transmitted
 func (sm *SocketManager) respondToVehicle(record *telemetry.Record, err error) {
 	var response []byte
-	logInfo := fmt.Sprintf("txid=%v, txtype=%v", record.Txid, record.TxType)
+
+	logInfo := logrus.LogInfo{"txid": record.Txid, "record_type": record.TxType}
 
 	if err != nil {
-		logInfo = fmt.Sprintf("%s client_id=%s", logInfo, sm.requestIdentity.DeviceID)
-		sm.logger.Errorf("unexpected_record error=%v %v", err, logInfo)
+		logInfo["client_id"] = sm.requestIdentity.DeviceID
+		sm.logger.ErrorLog("unexpected_record", err, logInfo)
 		metricsRegistry.unexpectedRecordErrorCount.Inc(map[string]string{})
 		response = record.Error(errors.New("incorrect message format"))
-		logInfo = fmt.Sprintf("%s response_type=error", logInfo)
+		logInfo["response_type"] = "error"
 	} else {
-		logInfo = fmt.Sprintf("%s response_type=ack", logInfo)
+		logInfo["response_type"] = "ack"
 		response = record.Ack()
 	}
 
-	sm.logger.Debugf("message_respond %v", logInfo)
+	sm.logger.Log(logrus.DEBUG, "message_respond", logInfo)
 	sm.writeChan <- SocketMessage{sm.MsgType, response}
 }
 
 func (sm *SocketManager) writer() {
 	defer func() {
-		sm.logger.Debugf("writer_done")
+
+		sm.logger.Log(logrus.DEBUG, "writer_done", nil)
 		_ = sm.Ws.SetReadDeadline(time.Now().Add(ReadWriteExitDeadline))
 	}()
 
 	for {
 		select {
 		case <-sm.stopChan:
-			sm.logger.Debugf("return_stop_chan")
+			sm.logger.Log(logrus.DEBUG, "return_stop_chan", nil)
 			return
 		case msg := <-sm.writeChan:
 			err := sm.writeMessage(msg.MsgType, msg.Msg)
 			if err != nil {
 				metricsRegistry.socketErrorCount.Inc(map[string]string{})
-				sm.logger.Errorf("socket_err error=%v", err)
+				sm.logger.ErrorLog("socket_err", err, nil)
 				return
 			}
 		}
@@ -317,26 +322,6 @@ func (sm SocketManager) ReportMetricBytesPerRecords(recordType string, byteSize 
 
 	metricsRegistry.recordSizeBytesTotal.Add(int64(byteSize), map[string]string{"record_type": recordType})
 	metricsRegistry.recordCount.Inc(map[string]string{"record_type": recordType})
-}
-
-// DatastoreAckProcessor records metrics after acking records
-func (sm SocketManager) DatastoreAckProcessor(ackChan chan (*telemetry.Record)) {
-	for record := range ackChan {
-		durationMs := time.Since(record.ProduceTime) / time.Millisecond
-
-		metricsRegistry.kafkaWriteMs.Observe(int64(durationMs), map[string]string{})
-		metricsRegistry.kafkaWriteBytesTotal.Add(int64(record.Length()), map[string]string{"record_type": record.TxType})
-		metricsRegistry.kafkaWriteCount.Inc(map[string]string{"record_type": record.TxType})
-
-		if record.Serializer != nil && record.Serializer.ReliableAck() {
-			if socket := sm.registry.GetSocket(record.SocketID); socket != nil {
-				metricsRegistry.reliableAckCount.Inc(map[string]string{"record_type": record.TxType})
-				socket.respondToVehicle(record, nil)
-			} else {
-				metricsRegistry.reliableAckMissCount.Inc(map[string]string{"record_type": record.TxType})
-			}
-		}
-	}
 }
 
 func registerMetricsOnce(metricsCollector metrics.MetricCollector) {
@@ -398,33 +383,4 @@ func registerMetrics(metricsCollector metrics.MetricCollector) {
 		Labels: []string{"record_type"},
 	})
 
-	metricsRegistry.kafkaWriteCount = metricsCollector.RegisterCounter(adapter.CollectorOptions{
-		Name:   "kafka_write_total",
-		Help:   "The number of writes to Kafka.",
-		Labels: []string{"record_type"},
-	})
-
-	metricsRegistry.kafkaWriteBytesTotal = metricsCollector.RegisterCounter(adapter.CollectorOptions{
-		Name:   "kafka_write_total_bytes",
-		Help:   "The number of bytes written to Kafka.",
-		Labels: []string{"record_type"},
-	})
-
-	metricsRegistry.kafkaWriteMs = metricsCollector.RegisterTimer(adapter.CollectorOptions{
-		Name:   "kafka_write_ms",
-		Help:   "The ms spent writing to Kafka.",
-		Labels: []string{},
-	})
-
-	metricsRegistry.reliableAckCount = metricsCollector.RegisterCounter(adapter.CollectorOptions{
-		Name:   "reliable_ack",
-		Help:   "The number of reliable acknowledgements.",
-		Labels: []string{"record_type"},
-	})
-
-	metricsRegistry.reliableAckMissCount = metricsCollector.RegisterCounter(adapter.CollectorOptions{
-		Name:   "reliable_ack_miss",
-		Help:   "The number of missing reliable acknowledgements.",
-		Labels: []string{"record_type"},
-	})
 }

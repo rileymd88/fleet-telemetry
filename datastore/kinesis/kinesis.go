@@ -8,27 +8,32 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/kinesis"
-	"github.com/sirupsen/logrus"
 
+	logrus "github.com/teslamotors/fleet-telemetry/logger"
 	"github.com/teslamotors/fleet-telemetry/metrics"
 	"github.com/teslamotors/fleet-telemetry/metrics/adapter"
+	"github.com/teslamotors/fleet-telemetry/server/airbrake"
 	"github.com/teslamotors/fleet-telemetry/telemetry"
 )
 
 // Producer client to handle kinesis interactions
 type Producer struct {
-	kinesis           *kinesis.Kinesis
-	logger            *logrus.Logger
-	prometheusEnabled bool
-	metricsCollector  metrics.MetricCollector
-	streams           map[string]string
+	kinesis            *kinesis.Kinesis
+	logger             *logrus.Logger
+	prometheusEnabled  bool
+	metricsCollector   metrics.MetricCollector
+	streams            map[string]string
+	airbrakeHandler    *airbrake.AirbrakeHandler
+	ackChan            chan (*telemetry.Record)
+	reliableAckTxTypes map[string]interface{}
 }
 
 // Metrics stores metrics reported from this package
 type Metrics struct {
-	errorCount   adapter.Counter
-	publishCount adapter.Counter
-	byteTotal    adapter.Counter
+	errorCount       adapter.Counter
+	publishCount     adapter.Counter
+	byteTotal        adapter.Counter
+	reliableAckCount adapter.Counter
 }
 
 var (
@@ -37,7 +42,7 @@ var (
 )
 
 // NewProducer configures and tests the kinesis connection
-func NewProducer(maxRetries int, streams map[string]string, overrideHost string, prometheusEnabled bool, metricsCollector metrics.MetricCollector, logger *logrus.Logger) (telemetry.Producer, error) {
+func NewProducer(maxRetries int, streams map[string]string, overrideHost string, prometheusEnabled bool, metricsCollector metrics.MetricCollector, airbrakeHandler *airbrake.AirbrakeHandler, ackChan chan (*telemetry.Record), reliableAckTxTypes map[string]interface{}, logger *logrus.Logger) (telemetry.Producer, error) {
 	registerMetricsOnce(metricsCollector)
 
 	config := &aws.Config{
@@ -61,11 +66,14 @@ func NewProducer(maxRetries int, streams map[string]string, overrideHost string,
 	}
 
 	return &Producer{
-		kinesis:           service,
-		logger:            logger,
-		prometheusEnabled: prometheusEnabled,
-		metricsCollector:  metricsCollector,
-		streams:           streams,
+		kinesis:            service,
+		logger:             logger,
+		prometheusEnabled:  prometheusEnabled,
+		metricsCollector:   metricsCollector,
+		streams:            streams,
+		airbrakeHandler:    airbrakeHandler,
+		ackChan:            ackChan,
+		reliableAckTxTypes: reliableAckTxTypes,
 	}, nil
 }
 
@@ -74,7 +82,7 @@ func (p *Producer) Produce(entry *telemetry.Record) {
 	entry.ProduceTime = time.Now()
 	stream, ok := p.streams[entry.TxType]
 	if !ok {
-		p.logger.Errorf("kinesis_produce_stream_not_configured: %s", entry.TxType)
+		p.ReportError("kinesis_produce_stream_not_configured", nil, logrus.LogInfo{"record_type": entry.TxType})
 		return
 	}
 	kinesisRecord := &kinesis.PutRecordInput{
@@ -85,15 +93,31 @@ func (p *Producer) Produce(entry *telemetry.Record) {
 
 	kinesisRecordOutput, err := p.kinesis.PutRecord(kinesisRecord)
 	if err != nil {
-		p.logger.Errorf("kinesis_err: %v", err)
+		p.ReportError("kinesis_err", err, nil)
 		metricsRegistry.errorCount.Inc(map[string]string{"record_type": entry.TxType})
 		return
+	} else {
+		p.ProcessReliableAck(entry)
 	}
 
-	p.logger.Debugf("kinesis_publish vin=%s,type=%s,txid=%s,shard_id=%s,sequence_number=%s", entry.Vin, entry.TxType, entry.Txid, *kinesisRecordOutput.ShardId, *kinesisRecordOutput.SequenceNumber)
-
+	p.logger.Log(logrus.DEBUG, "kinesis_message_dispatched", logrus.LogInfo{"vin": entry.Vin, "record_type": entry.TxType, "txid": entry.Txid, "shard_id": *kinesisRecordOutput.ShardId, "sequence_number": *kinesisRecordOutput.SequenceNumber})
 	metricsRegistry.publishCount.Inc(map[string]string{"record_type": entry.TxType})
 	metricsRegistry.byteTotal.Add(int64(entry.Length()), map[string]string{"record_type": entry.TxType})
+}
+
+// ProcessReliableAck sends to ackChan if reliable ack is configured
+func (p *Producer) ProcessReliableAck(entry *telemetry.Record) {
+	_, ok := p.reliableAckTxTypes[entry.TxType]
+	if ok {
+		p.ackChan <- entry
+		metricsRegistry.reliableAckCount.Inc(map[string]string{"record_type": entry.TxType})
+	}
+}
+
+// ReportError to airbrake and logger
+func (p *Producer) ReportError(message string, err error, logInfo logrus.LogInfo) {
+	p.airbrakeHandler.ReportLogMessage(logrus.ERROR, message, err, logInfo)
+	p.logger.ErrorLog(message, err, logInfo)
 }
 
 func registerMetricsOnce(metricsCollector metrics.MetricCollector) {
@@ -116,6 +140,12 @@ func registerMetrics(metricsCollector metrics.MetricCollector) {
 	metricsRegistry.byteTotal = metricsCollector.RegisterCounter(adapter.CollectorOptions{
 		Name:   "kinesis_publish_total_bytes",
 		Help:   "The number of bytes published to Kinesis.",
+		Labels: []string{"record_type"},
+	})
+
+	metricsRegistry.reliableAckCount = metricsCollector.RegisterCounter(adapter.CollectorOptions{
+		Name:   "kinesis_reliable_ack_total",
+		Help:   "The number of records produced to Kinesis for which we sent a reliable ACK.",
 		Labels: []string{"record_type"},
 	})
 }
