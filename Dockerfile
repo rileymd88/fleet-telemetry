@@ -21,7 +21,7 @@ RUN make install
 
 WORKDIR /go/src/fleet-telemetry
 
-COPY . .
+COPY ./fleet-telemetry .
 ENV CGO_ENABLED=1
 ENV CGO_LDFLAGS="-lstdc++"
 
